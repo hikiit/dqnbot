@@ -41,7 +41,7 @@ class DQNBot(gym.core.Env):
         self.cur = self.con.cursor()
         
         low_list = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-        high_list = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+        high_list = [2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
 
         low = np.array(low_list)
         high = np.array(high_list)
@@ -143,9 +143,9 @@ if __name__ == "__main__":
 
         # DQNのネットワーク定義
         model = Sequential()
-        model.add(LSTM(units=1024, return_sequences=True, input_shape=input_shape))
+        model.add(LSTM(units=512, return_sequences=True, input_shape=input_shape))
         model.add(Dropout(dropout))
-        model.add(LSTM(units=1024, return_sequences=False))
+        model.add(LSTM(units=512, return_sequences=False))
         model.add(Dense(units=nb_actions))
         print(model.summary())
 
@@ -161,7 +161,7 @@ if __name__ == "__main__":
 
         tbcb = TensorBoard(log_dir='./graph', histogram_freq=0, write_grads=True)
     
-        history = dqn.fit(env, nb_steps=200000, verbose=2, nb_max_episode_steps=1440, callbacks=[tbcb])
+        history = dqn.fit(env, nb_steps=100000, verbose=2, nb_max_episode_steps=1440, callbacks=[tbcb])
 
         now = datetime.now().strftime("%Y%m%d%H%M%S")
         dqn.save_weights('weight_' + str(now) + '.h5')
