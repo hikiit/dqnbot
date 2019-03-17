@@ -5,11 +5,14 @@ from datetime import datetime
 from sklearn import preprocessing
 import gym
 import gym.spaces
+import pickle
 import numpy as np
 from keras.models import Sequential
-from keras.layers import Dense, Activation, Flatten, LSTM
+from keras.layers import Dense, Activation, Flatten, LSTM, Dropout
 from keras.optimizers import Adam
 from keras.models import model_from_json
+from keras.callbacks import TensorBoard
+from keras.initializers import TruncatedNormal
 
 from rl.agents.dqn import DQNAgent
 from rl.policy import EpsGreedyQPolicy
@@ -17,7 +20,6 @@ from rl.policy import BoltzmannQPolicy
 from rl.policy import GreedyQPolicy
 from rl.policy import BoltzmannGumbelQPolicy
 from rl.memory import SequentialMemory
-from keras.initializers import TruncatedNormal
 
 import rl.callbacks
 import matplotlib.pyplot as plt
@@ -32,20 +34,25 @@ class DQNBot(gym.core.Env):
         self.BUY = 0
         self.SELL = 1
         self.STAY = 2
-        self.action_space = gym.spaces.Discrete(3)
+        self.action_space = gym.spaces.Discrete(2)
 
         self.con = sqlite3.connect(sys.argv[1])
         self.cur = self.con.cursor()
         
         low_list = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        # low_list = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
         high_list = [2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+        # high_list = [2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
 
         low = np.array(low_list)
         high = np.array(high_list)
 
         board_df = psql.read_sql('SELECT ask_price_100, ask_price_200, ask_price_300, ask_price_500, ask_price_800, ask_price_1300, ask_price_2100, ask_price_3400, ask_price_5500, ask_price_8900, \
                                         bid_price_100, bid_price_200, bid_price_300, bid_price_500, bid_price_800, bid_price_1300, bid_price_2100, bid_price_3400, bid_price_5500, bid_price_8900 FROM boards;', self.con) # DBからPandasデータフレーム取得
-        
+        '''
+        board_df = psql.read_sql('SELECT ask_price_500, ask_price_800, ask_price_1300, ask_price_2100, ask_price_3400, ask_price_5500, ask_price_8900, \
+                                        bid_price_500, bid_price_800, bid_price_1300, bid_price_2100, bid_price_3400, bid_price_5500, bid_price_8900 FROM boards;', self.con) # DBからPandasデータフレーム取得
+        '''
         board_mid_df = psql.read_sql('SELECT mid_price FROM boards;', self.con) # DBからPandasデータフレーム取得
 
         self.observation_space = gym.spaces.Box(low=low, high=high)
@@ -53,6 +60,7 @@ class DQNBot(gym.core.Env):
         self.board_array = preprocessing.minmax_scale(board_df.values, axis=1)
         self.board_array_rows = len(self.board_array)
         self.board_mid = board_mid_df.values
+        self.step_count = 0
         
     def get_state(self, count):
         return self.board_array[count].flatten()
@@ -68,6 +76,8 @@ class DQNBot(gym.core.Env):
     def step(self, action):
         self.step_count += 1
         done = self.board_array_rows - 20 < self.step_count
+        if done:
+            self.step_count = 0
         
         reward = 0
         if action == self.BUY:
@@ -87,7 +97,7 @@ class DQNBot(gym.core.Env):
                 self.pos = [self.STAY, 0]
                 if sys.argv[2] == 'train':
                     done = True
-
+                    
         # 次のstate、reward、終了したかどうか、追加情報の順に返す
         # 追加情報は特にないので空dict
         return np.insert(self.get_state(self.step_count), 0, self.pos[0]), reward, done, {}
@@ -125,31 +135,37 @@ if __name__ == "__main__":
 
     if sys.argv[2] == 'train':
         input_shape = (1,) + env.observation_space.shape
+        dropout = 0
 
         # DQNのネットワーク定義
         model = Sequential()
-        model.add(LSTM(units=16, return_sequences=False, input_shape=input_shape))
-        # model.add(LSTM(units=16, return_sequences=False))
+        model.add(LSTM(units=512, return_sequences=True, input_shape=input_shape))
+        model.add(Dropout(dropout))
+        model.add(LSTM(units=512, return_sequences=False))
         model.add(Dense(units=nb_actions))
         print(model.summary())
 
         # experience replay用のmemory
-        memory = SequentialMemory(limit=2000000, window_length=1)
+        memory = SequentialMemory(limit=5000000, window_length=1)
         # 行動方策はオーソドックスなepsilon-greedy。ほかに、各行動のQ値によって確率を決定するBoltzmannQPolicyが利用可能
         # policy = GreedyQPolicy()
         # policy = BoltzmannQPolicy()
         policy = EpsGreedyQPolicy(eps=0.1)
         dqn = DQNAgent(model=model, nb_actions=nb_actions, memory=memory, nb_steps_warmup=100,
-                    target_model_update=1e-2, policy=policy)
-        dqn.compile(Adam(lr=0.002))
+                    target_model_update=2e-2, policy=policy)
+        dqn.compile(Adam(lr=0.001))
+
+        tbcb = TensorBoard(log_dir='./graph', histogram_freq=0, write_grads=True)
     
-        history = dqn.fit(env, nb_steps=1800, visualize=False, verbose=2, nb_max_episode_steps=1440)
+        history = dqn.fit(env, nb_steps=50000, verbose=2, nb_max_episode_steps=1440, callbacks=[tbcb])
 
         now = datetime.now().strftime("%Y%m%d%H%M%S")
         dqn.save_weights('weight_' + str(now) + '.h5')
         model_json = model.to_json()
         with open('model_' + str(now) + '.json', "w") as json_file:
             json_file.write(model_json)
+        with open("history.pickle", mode='wb') as f:
+            pickle.dump(history.history, f)
     
     elif sys.argv[2] == 'test':
         json_file = open(sys.argv[3], 'r')
@@ -175,7 +191,7 @@ if __name__ == "__main__":
                 ac_list.append(ep_action)
                 pre = ep_action
             else:
-                ac_list.append(2)
+                ac_list.append(-1)
         print("BUY : " + str(ac_list.count(0)))
         print("SELL: " + str(ac_list.count(1)))
         count = 0
