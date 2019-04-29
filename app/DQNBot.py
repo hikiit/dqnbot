@@ -5,21 +5,16 @@ from datetime import datetime
 from sklearn import preprocessing
 import gym
 import gym.spaces
-import pickle
 import numpy as np
 from keras.models import Sequential
-from keras.layers import Dense, Activation, Flatten, LSTM, Dropout
+from keras.layers import Dense, Activation, Flatten, LSTM
 from keras.optimizers import Adam
 from keras.models import model_from_json
-from keras.callbacks import TensorBoard
-from keras.initializers import TruncatedNormal
 
 from rl.agents.dqn import DQNAgent
 from rl.policy import EpsGreedyQPolicy
-from rl.policy import BoltzmannQPolicy
-from rl.policy import GreedyQPolicy
-from rl.policy import BoltzmannGumbelQPolicy
 from rl.memory import SequentialMemory
+from keras.initializers import TruncatedNormal
 
 import rl.callbacks
 import matplotlib.pyplot as plt
@@ -28,53 +23,66 @@ import pandas as pd
 import pandas.io.sql as psql
 import sqlite3
 
-# 直線上を動く点の速度を操作し、目標(原点)に移動させることを目標とする環境
 class DQNBot(gym.core.Env):
     def __init__(self):
+        # Agentにさせる行動はBUY/SELL/STAY(何もしない)
         self.BUY = 0
         self.SELL = 1
         self.STAY = 2
-        self.action_space = gym.spaces.Discrete(2)
+        self.action_space = gym.spaces.Discrete(3)
 
         self.con = sqlite3.connect(sys.argv[1])
         self.cur = self.con.cursor()
         
+        # ask/bidの観測範囲
+        # 0番目は BUY SELL STAYで0-2
+        # それ以外は0-1で正規化する
         low_list = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-        # low_list = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
         high_list = [2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
-        # high_list = [2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
 
         low = np.array(low_list)
         high = np.array(high_list)
 
+        # DBからask/bidのpandasデータフレームを取得
         board_df = psql.read_sql('SELECT ask_price_100, ask_price_200, ask_price_300, ask_price_500, ask_price_800, ask_price_1300, ask_price_2100, ask_price_3400, ask_price_5500, ask_price_8900, \
                                         bid_price_100, bid_price_200, bid_price_300, bid_price_500, bid_price_800, bid_price_1300, bid_price_2100, bid_price_3400, bid_price_5500, bid_price_8900 FROM boards;', self.con) # DBからPandasデータフレーム取得
-        '''
-        board_df = psql.read_sql('SELECT ask_price_500, ask_price_800, ask_price_1300, ask_price_2100, ask_price_3400, ask_price_5500, ask_price_8900, \
-                                        bid_price_500, bid_price_800, bid_price_1300, bid_price_2100, bid_price_3400, bid_price_5500, bid_price_8900 FROM boards;', self.con) # DBからPandasデータフレーム取得
-        '''
-        board_mid_df = psql.read_sql('SELECT mid_price FROM boards;', self.con) # DBからPandasデータフレーム取得
+        
+        # DBからmidpriceのpandasデータフレームを取得
+        board_mid_df = psql.read_sql('SELECT mid_price FROM boards;', self.con)
 
+        # 観測範囲を定義
         self.observation_space = gym.spaces.Box(low=low, high=high)
 
+        # 0-1で正規化して配列取得
         self.board_array = preprocessing.minmax_scale(board_df.values, axis=1)
+        
+        # DBの長さを取得
         self.board_array_rows = len(self.board_array)
+
+        # midpriceの配列を用意
         self.board_mid = board_mid_df.values
+
+
         self.step_count = 0
         
+    # 指定stepのask/bidを取得
     def get_state(self, count):
         return self.board_array[count].flatten()
     
-    def get_midprice_list(self):
-        return self.board_mid.flatten()
-
+    # 指定stepのmidpriceを取得
     def get_midprice(self, count):
         return self.board_mid[count].flatten()[0]
+
+    # 視覚化の時にだけ使用 本来は多分いらない
+    def get_midprice_list(self):
+        return self.board_mid.flatten()
     
     # 各stepごとに呼ばれる
-    # actionを受け取り、次のstateとreward、episodeが終了したかどうかを返すように実装
     def step(self, action):
+        # stepのカウントアップ
         self.step_count += 1
+
+        # 学習データが終わりそうならdoneをTrueにしてstepを0に戻す
         done = self.board_array_rows - 20 < self.step_count
         if done:
             self.step_count = 0
@@ -86,6 +94,7 @@ class DQNBot(gym.core.Env):
             elif self.pos[0] == self.SELL:
                 reward = self.pos[1] - self.get_midprice(self.step_count)
                 self.pos = [self.STAY, 0]
+                # 学習時は売買が成立した時点で区切る(=結果を学習させる)
                 if sys.argv[2] == 'train':
                     done = True
 
@@ -99,19 +108,24 @@ class DQNBot(gym.core.Env):
                     done = True
                     
         # 次のstate、reward、終了したかどうか、追加情報の順に返す
+        # ask/bidの情報 + ポジション情報を渡す
         # 追加情報は特にないので空dict
         return np.insert(self.get_state(self.step_count), 0, self.pos[0]), reward, done, {}
 
-    # 各episodeの開始時に呼ばれ、初期stateを返すように実装
+    # 各episodeの開始時に呼ばれる
+    # 初期情報を渡す
     def reset(self):
         self.pos = [self.STAY, 0]
         self.profit = 0
         if sys.argv[2] == 'train':
-            self.step_count = random.randint(0, self.board_array_rows - 2000)
+            pass
+            # randomにしてもいいかもしれないですね
+            # self.step_count = random.randint(0, self.board_array_rows - 2000)
         else:
             self.step_count = 0
         return np.insert(self.get_state(self.step_count), 0, self.pos[0])
 
+# 学習状況の保存
 class EpisodeLogger(rl.callbacks.Callback):
     def __init__(self):
         self.observations = {}
@@ -135,73 +149,86 @@ if __name__ == "__main__":
 
     if sys.argv[2] == 'train':
         input_shape = (1,) + env.observation_space.shape
-        dropout = 0
 
         # DQNのネットワーク定義
+        # とりあえずオプションはデフォルト
         model = Sequential()
-        model.add(LSTM(units=512, return_sequences=True, input_shape=input_shape))
-        model.add(Dropout(dropout))
-        model.add(LSTM(units=512, return_sequences=False))
-        model.add(Dense(units=nb_actions))
+        model.add(Flatten(input_shape=(1,) + env.observation_space.shape))
+        model.add(Dense(512))
+        model.add(Dense(512))
+        model.add(Dense(nb_actions))
         print(model.summary())
 
         # experience replay用のmemory
-        memory = SequentialMemory(limit=5000000, window_length=1)
-        # 行動方策はオーソドックスなepsilon-greedy。ほかに、各行動のQ値によって確率を決定するBoltzmannQPolicyが利用可能
-        # policy = GreedyQPolicy()
-        # policy = BoltzmannQPolicy()
+        # 各ステップごと順番に学習させるわけではく、一度メモリに保存してからランダムに抽出と学習するとか
+        # 正直、完全には理解できていません
+        memory = SequentialMemory(limit=40000, window_length=1)
+
+        # 行動方策はオーソドックスなepsilon-greedyです。
         policy = EpsGreedyQPolicy(eps=0.1)
+        
+        # warmup = 文字通り準備運動のイメージ いきなり学習させずにある程度メモリに貯めると思ってる
+        # update = 学習率 小さくすると時間がかかるし、高くすると過学習しやすくなる
         dqn = DQNAgent(model=model, nb_actions=nb_actions, memory=memory, nb_steps_warmup=100,
-                    target_model_update=2e-2, policy=policy)
+                    target_model_update=1e-2, policy=policy)
         dqn.compile(Adam(lr=0.001))
 
-        tbcb = TensorBoard(log_dir='./graph', histogram_freq=0, write_grads=True)
-    
-        history = dqn.fit(env, nb_steps=50000, verbose=2, nb_max_episode_steps=1440, callbacks=[tbcb])
+        # nb_steps = 何ステップ学習させるか 数値をめちゃくちゃ大きくして、一晩経ったらCtrl+Cで止めるとかでも別にいい
+        # max_episode_steps = 1エピソードの最大ステップ
+        history = dqn.fit(env, nb_steps=400000, visualize=False, verbose=2, nb_max_episode_steps=1440)
 
+        # modelとweightの保存    
         now = datetime.now().strftime("%Y%m%d%H%M%S")
         dqn.save_weights('weight_' + str(now) + '.h5')
         model_json = model.to_json()
         with open('model_' + str(now) + '.json', "w") as json_file:
             json_file.write(model_json)
-        with open("history.pickle", mode='wb') as f:
-            pickle.dump(history.history, f)
     
     elif sys.argv[2] == 'test':
+        # modelのロード
         json_file = open(sys.argv[3], 'r')
         loaded_model_json = json_file.read()
         json_file.close()
         model = model_from_json(loaded_model_json)
         print(model.summary())
 
+        # 学習後のテストをしたいだけなのに以下宣言が必要なのかは不明 一応同じようにdqnを設定していく
         memory = SequentialMemory(limit=2000000, window_length=1)
         policy = EpsGreedyQPolicy(eps=0.1)
         dqn = DQNAgent(model=model, nb_actions=nb_actions, memory=memory, nb_steps_warmup=100,
                     target_model_update=1e-2, policy=policy)
-        dqn.compile(Adam(lr=0.002))
+        dqn.compile(Adam(lr=0.001))
+
+        # weighのロード
         dqn.load_weights(sys.argv[4])
     
         cb_ep = EpisodeLogger()
+
+        # テストを実行
+        # データベースで一通り売買してもらう
+        # 時間がかかるので、consoleに状況を出すようにstepメソッド内で実装してもいいかも
         dqn.test(env, nb_episodes=1, visualize=False, callbacks=[cb_ep])
 
-        pre = 2
-        ac_list = []
-        for ep_action in list(cb_ep.actions.values())[0]:
-            if pre != ep_action and ep_action != 2:
-                ac_list.append(ep_action)
-                pre = ep_action
-            else:
-                ac_list.append(-1)
-        print("BUY : " + str(ac_list.count(0)))
-        print("SELL: " + str(ac_list.count(1)))
-        count = 0
-        for ac in ac_list:
-            if ac == 0:
-                plt.axvline(x=count, ymin=0, ymax=400000, color='r', linewidth=1)
-            elif ac == 1:
-                plt.axvline(x=count, ymin=0, ymax=400000, color='b', linewidth=1)
-            count += 1
-        plt.plot(env.get_midprice_list())
+        # 結果の視覚化
+        print("COUNT BUY  : " + str(list(cb_ep.actions.values())[0].count(0)))
+        print("COUNT SELL : " + str(list(cb_ep.actions.values())[0].count(1)))
+        print("COUNT STAY : " + str(list(cb_ep.actions.values())[0].count(2)))
+
+        plt.subplot(211)
+        plt.plot(env.get_midprice_list(), linewidth=0.1)
+
+        plt.subplot(212)
+        rw_list = []
+        reward = 0
+        for ep_reward in list(cb_ep.rewards.values())[0]:
+            reward += ep_reward
+            rw_list.append(reward)
+            print("\rReward: " + str(len(rw_list)), end='')
+        print("")
+
+        plt.plot(rw_list)
         plt.xlabel("step")
         plt.ylabel("price")
-        plt.savefig('figure.png')
+        
+        # dpiが低いと荒すぎる
+        plt.savefig("figure.png",format = 'png', dpi=1200)
